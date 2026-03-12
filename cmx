@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SESSION_FILE="$HOME/Library/Application Support/cmux/session-com.cmuxterm.app.json"
+SOCKET_TIMEOUT_SEC=30
+SESSION_TIMEOUT_SEC=15
+CMX_MAXIMIZE_WINDOW="${CMX_MAXIMIZE_WINDOW:-1}"
+
+log() {
+  printf '[cmx] %s\n' "$*"
+}
+
+require_command() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    log "必要なコマンドが見つかりません: $cmd"
+    exit 1
+  fi
+}
+
+wait_for_cmux_socket() {
+  local i
+  for i in $(seq 1 "$SOCKET_TIMEOUT_SEC"); do
+    if cmux ping 2>/dev/null | grep -qi 'pong'; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+wait_for_session_file() {
+  local i
+  for i in $(seq 1 "$SESSION_TIMEOUT_SEC"); do
+    if [[ -s "$SESSION_FILE" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+maximize_cmux_window() {
+  # フルスクリーンではなく「画面いっぱいの通常ウィンドウ」にする。
+  # フルスクリーン遷移はアニメーションとSpace移動で不安定なため避ける。
+  osascript <<'APPLESCRIPT' >/dev/null 2>&1 || true
+tell application "cmux"
+  activate
+  delay 0.2
+  set screenBounds to bounds of window of desktop
+  try
+    set bounds of front window to screenBounds
+  end try
+end tell
+APPLESCRIPT
+}
+
+quit_cmux() {
+  osascript -e 'tell application "cmux" to quit' >/dev/null 2>&1 || true
+
+  local i
+  for i in $(seq 1 20); do
+    if ! pgrep -x cmux >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  pkill -x cmux >/dev/null 2>&1 || true
+  sleep 1
+}
+
+get_focused_surface() {
+  cmux list-pane-surfaces 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i ~ /^surface:[0-9]+$/) {print $i; exit}}'
+}
+
+new_split_surface() {
+  local direction="$1"
+  local surface="$2"
+  local out
+
+  out=$(cmux new-split "$direction" --surface "$surface" 2>&1) || {
+    log "split失敗 (${direction}, ${surface}): $out"
+    exit 1
+  }
+
+  awk '{for (i=1;i<=NF;i++) if ($i ~ /^surface:[0-9]+$/) {print $i; exit}}' <<<"$out"
+}
+
+apply_equal_columns_layout() {
+  python3 - <<'PYEOF'
+import json
+import os
+import sys
+
+path = os.path.expanduser('~/Library/Application Support/cmux/session-com.cmuxterm.app.json')
+if not os.path.exists(path):
+    print('session file not found', file=sys.stderr)
+    sys.exit(1)
+
+with open(path) as f:
+    data = json.load(f)
+
+try:
+    layout = data['windows'][0]['tabManager']['workspaces'][0]['layout']
+    # 3列レイアウト前提: left vs (mid+right), then mid vs right
+    layout['split']['dividerPosition'] = 1 / 3
+    layout['split']['second']['split']['dividerPosition'] = 0.5
+except (KeyError, TypeError, IndexError) as exc:
+    print(f'layout parse failed: {exc}', file=sys.stderr)
+    sys.exit(1)
+
+with open(path, 'w') as f:
+    json.dump(data, f)
+PYEOF
+}
+
+require_command cmux
+require_command osascript
+require_command python3
+
+if [[ ! -d "/Applications/cmux.app" ]]; then
+  log 'cmux.app が /Applications に見つかりません'
+  exit 1
+fi
+
+log 'cmuxを終了してクリーン状態にします'
+quit_cmux
+
+log '古いセッションを削除します'
+rm -f "$SESSION_FILE"
+
+log 'cmuxを起動します'
+open -a cmux
+
+if ! wait_for_cmux_socket; then
+  log 'cmuxソケット待機がタイムアウトしました'
+  exit 1
+fi
+
+if [[ "$CMX_MAXIMIZE_WINDOW" == "1" ]]; then
+  log 'cmuxウィンドウを最大化します'
+  maximize_cmux_window
+  sleep 0.4
+fi
+
+BASE_SURFACE=$(get_focused_surface)
+if [[ -z "$BASE_SURFACE" ]]; then
+  log '初期surfaceの取得に失敗しました'
+  exit 1
+fi
+
+log "6ペインを作成します (3列 x 2行) base=${BASE_SURFACE}"
+COL2=$(new_split_surface right "$BASE_SURFACE")
+if [[ -z "$COL2" ]]; then
+  log '2列目のsurface取得に失敗しました'
+  exit 1
+fi
+
+COL3=$(new_split_surface right "$COL2")
+if [[ -z "$COL3" ]]; then
+  log '3列目のsurface取得に失敗しました'
+  exit 1
+fi
+
+cmux new-split down --surface "$BASE_SURFACE" >/dev/null
+cmux new-split down --surface "$COL2" >/dev/null
+cmux new-split down --surface "$COL3" >/dev/null
+
+log 'cmuxを終了してレイアウト値を書き換えます'
+quit_cmux
+
+if ! wait_for_session_file; then
+  log 'セッションファイル生成待機がタイムアウトしました'
+  exit 1
+fi
+
+if ! apply_equal_columns_layout; then
+  log 'セッション書き換えに失敗しました'
+  exit 1
+fi
+
+log 'cmuxを再起動します'
+open -a cmux
+
+if ! wait_for_cmux_socket; then
+  log '再起動後のcmuxソケット待機がタイムアウトしました'
+  exit 1
+fi
+
+if [[ "$CMX_MAXIMIZE_WINDOW" == "1" ]]; then
+  maximize_cmux_window
+fi
+
+log '完了: 均等6ペインで起動しました'
